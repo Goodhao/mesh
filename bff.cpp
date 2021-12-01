@@ -1,5 +1,4 @@
 #include "bff.h"
-#include <set>
 
 #define PI acos(-1)
 
@@ -57,11 +56,15 @@ std::vector<MeshKernel::EdgeHandle> bff::AroundEdge(MeshKernel::VertexHandle vh)
 
 void bff::Parameterization() {
 	// 第一步 计算共形因子u
-	Eigen::MatrixXd ui = Aii.inverse() * -K;
+	Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
+	Eigen::SparseMatrix<double> Aii_sparse = Aii.sparseView();
+	solver.compute(Aii_sparse);
+	//Eigen::MatrixXd ui = Aii.inverse() * -K;
+	Eigen::MatrixXd ui = solver.solve(-K);
 	Eigen::MatrixXd ub = Eigen::MatrixXd::Zero(bn, 1);
 	Eigen::MatrixXd u(n, 1);
 	u << ui,
-		 ub;
+		ub;
 	// for (int i = 0; i < in; i++) std::cout << ui(i, 0) << std::endl;
 	// 第二步 计算新边界点的角度k_tilde
 	Eigen::MatrixXd h = -Abi * ui;
@@ -74,24 +77,45 @@ void bff::Parameterization() {
 			break;
 		}
 	}
-	double angle = 0;
-	std::map<int, MeshKernel::Vertex> gamma;
+	MeshKernel::VertexHandle s2 = s; // record
 	
-	MeshKernel::Vertex d;
-	gamma[s] = MeshKernel::Vertex(0, 0, 0);
-	MeshKernel::VertexHandle start = s;
+
+	// 微调长度使得边界闭合
+	Eigen::MatrixXd N = Eigen::MatrixXd::Zero(bn, bn);
+	Eigen::MatrixXd T = Eigen::MatrixXd::Zero(2, bn);
+	Eigen::MatrixXd len = Eigen::MatrixXd::Zero(bn, 1), len_tilde = Eigen::MatrixXd::Zero(bn, 1);
+
+
+
+	double angle = 0;
 	while (1) {
 		auto eh = NextEdge(s);
 		if ((int)eh > mesh.EdgeSize()) break;
 		t = mesh.NeighborVhFromEdge(s, eh);
 		vis[eh] = 1;
 		angle += k_tilde(to_new[s] - in, 0);
-		d.x() = cos(angle), d.y() = sin(angle), d.z() = 0;
-		d = d * exp(0.5 * (u(to_new[s], 0) + u(to_new[t], 0))) * 
+		T(0, to_new[s] - in) = cos(angle), T(1, to_new[s] - in) = sin(angle);
+		len(to_new[s] - in, 0) = exp(0.5 * (u(to_new[s], 0) + u(to_new[t], 0))) *
 			(mesh.vertices(mesh.edges(eh).vh1()) - mesh.vertices(mesh.edges(eh).vh2())).norm();
-		gamma[t] = gamma[s] + d;
+		N(to_new[s] - in, to_new[s] - in) = 1 / len(to_new[s] - in, 0);
 		s = t;
 	}
+	len_tilde = len - (N.inverse() * T.transpose() * (T * N.inverse() * T.transpose()).inverse() * T) * len;
+	vis.clear();
+	angle = 0;
+	s = s2;
+	std::map<int, MeshKernel::Vertex> gamma;
+	gamma[s] = MeshKernel::Vertex(0, 0, 0);
+	while (1) {
+		auto eh = NextEdge(s);
+		if ((int)eh > mesh.EdgeSize()) break;
+		t = mesh.NeighborVhFromEdge(s, eh);
+		vis[eh] = 1;
+		angle += k_tilde(to_new[s] - in, 0);
+		gamma[t] = gamma[s] + MeshKernel::Vertex(T(0, to_new[s] - in), T(1, to_new[s] - in), 0) * len_tilde(to_new[s] - in, 0);
+		s = t;
+	}
+
 	//std::cout << "bn:" << bn << " " << gamma.size() << std::endl;
 	//std::cout << " total angle:" << angle*180/PI << std::endl;
 	Eigen::MatrixXd gamma_re = Eigen::MatrixXd::Zero(bn, 1);
@@ -100,14 +124,16 @@ void bff::Parameterization() {
 		gamma_re(to_new[x.first] - in, 0) = x.second.x();
 		gamma_im(to_new[x.first] - in, 0) = x.second.y();
 	}
-    /*
+	/*
 	for (auto x : gamma) {
 		std::cout << x.second.x() << " " << x.second.y() << " " << x.second.z() << std::endl;
 	}*/
 
 	// 第四步：延拓gamma为f
-	Eigen::MatrixXd ai = - Aii.inverse() * Aib * gamma_re;
-	Eigen::MatrixXd bi = - Aii.inverse() * Aib * gamma_im;
+	//Eigen::MatrixXd ai = -Aii.inverse() * Aib * gamma_re;
+	//Eigen::MatrixXd bi = -Aii.inverse() * Aib * gamma_im;
+	Eigen::MatrixXd ai = solver.solve(-Aib * gamma_re);
+	Eigen::MatrixXd bi = solver.solve(-Aib * gamma_im);
 	Eigen::MatrixXd a(n, 1);
 	a << ai,
 		gamma_re;
@@ -143,7 +169,7 @@ void bff::InitCurvature() {
 			defect += acos(cur * last / (cur.norm() * last.norm()));
 			defect = 2 * PI - defect;
 			K(to_new[vp.first], 0) = defect;
-			
+
 		}
 		else {
 			for (auto& eh : AroundEdge(vp.first)) {
@@ -164,7 +190,7 @@ void bff::InitCurvature() {
 
 void bff::Init() {
 	n = mesh.VertexSize();
-	for (auto &vp : mesh.allvertices()) {
+	for (auto& vp : mesh.allvertices()) {
 		if (!mesh.isOnBoundary(vp.first)) {
 			points.push_back(vp.first);
 			to_new[vp.first] = points.size() - 1;
@@ -173,7 +199,7 @@ void bff::Init() {
 	}
 	in = points.size();
 	bn = n - in;
-	for (auto &vp : mesh.allvertices()) {
+	for (auto& vp : mesh.allvertices()) {
 		if (mesh.isOnBoundary(vp.first)) {
 			points.push_back(vp.first);
 			to_new[vp.first] = points.size() - 1;
@@ -182,9 +208,9 @@ void bff::Init() {
 	}
 }
 
-inline Eigen::MatrixXd submatrix(Eigen::MatrixXd const &A,int x,int y,int h, int w) {
+inline Eigen::MatrixXd submatrix(Eigen::MatrixXd const& A, int x, int y, int h, int w) {
 	Eigen::MatrixXd B(h, w);
-	for (int i = 0; i < h; i++) for (int j = 0; j < w; j++)  {
+	for (int i = 0; i < h; i++) for (int j = 0; j < w; j++) {
 		B(i, j) = A(x + i, y + j);
 	}
 	return B;
