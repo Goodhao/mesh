@@ -1,14 +1,72 @@
 #include "bff.h"
+//#include <fstream>
 
 #define PI acos(-1)
 
 void bff::Execute() {
 	printf("boundary first flattening is starting\n");
+	//printf("detecting and filling holes\n");
+	fill_holes();
+	//printf("holes filled\n");
 	Init();
 	Laplace();
 	InitCurvature();
 	Parameterization();
 	printf("boundary first flattening success\n");
+}
+
+void bff::fill_holes() {
+	MeshKernel::VertexHandle s = MeshKernel::VertexHandle(0);
+	MeshKernel::VertexHandle t = MeshKernel::VertexHandle(0);
+	vis.clear();
+	int idx = 0;
+	double max_len = -1e6;
+	longest_loop_idx = 0;
+	for (auto& ep : mesh.alledges()) {
+		auto eh = ep.first;
+		if (mesh.isOnBoundary(eh) && !vis[eh]) {
+			s = ep.second.vh1();
+			double loop_len = 0;
+			std::set<MeshKernel::EdgeHandle> emp;
+			loops.push_back(emp);
+			while (1) {
+				auto eh = NextEdge(s);
+				if ((int)eh > mesh.EdgeSize()) break;
+				t = mesh.NeighborVhFromEdge(s, eh);
+				loops[idx].insert(eh);
+				vis[eh] = 1;
+				loop_len += (mesh.vertices(s) - mesh.vertices(t)).norm();
+				s = t;
+			}
+			if (loop_len > max_len) {
+				longest_loop_idx = idx;
+				max_len = loop_len;
+			}
+			idx++;
+		}
+	}
+	/*
+	std::cout << idx << std::endl;
+	for (int i = 0; i < idx; i++) {
+		std::cout << i << ": ";
+		for (auto x : loops[i]) std::cout << mesh.edges(x).vh1() << " ";
+		std::cout << std::endl;
+	}
+	std::cout << longest_loop_idx << std::endl;*/
+	MeshKernel::Vertex cc;
+	for (int i = 0; i < idx; i++) if (i != longest_loop_idx) {
+		cc = MeshKernel::Vertex(0, 0, 0);
+		for (auto x : loops[i]) {
+			cc = cc + mesh.vertices(mesh.edges(x).vh1());
+		}
+		cc = cc / (int)loops[i].size();
+		MeshKernel::VertexHandle cch = mesh.AddVertex(cc);
+		fake_points.insert(cch);
+		for (auto x : loops[i]) {
+			mesh.AddFace(std::vector<MeshKernel::VertexHandle>{cch, mesh.edges(x).vh1(), mesh.edges(x).vh2()});
+		}
+	}
+	vis.clear();
 }
 
 MeshKernel::EdgeHandle bff::NextEdge(MeshKernel::VertexHandle vh) {
@@ -20,7 +78,12 @@ MeshKernel::EdgeHandle bff::NextEdge(MeshKernel::VertexHandle vh) {
 		}
 	}
 	return MeshKernel::EdgeHandle(mesh.EdgeSize() + 10);
-	assert("something wrong" && 1 == 0);
+}
+
+double bff::Angle(MeshKernel::VertexHandle vh, MeshKernel::VertexHandle vh1, MeshKernel::VertexHandle vh2) {
+	auto d1 = mesh.vertices(vh1) - mesh.vertices(vh);
+	auto d2 = mesh.vertices(vh2) - mesh.vertices(vh);
+	return acos(d1 * d2 / (d1.norm() * d2.norm()));
 }
 
 std::vector<MeshKernel::EdgeHandle> bff::AroundEdge(MeshKernel::VertexHandle vh) {
@@ -31,7 +94,7 @@ std::vector<MeshKernel::EdgeHandle> bff::AroundEdge(MeshKernel::VertexHandle vh)
 	MeshKernel::VertexHandle cur, nxt;
 	for (auto& eh : mesh.NeighborEh(vh)) {
 		auto vh2 = mesh.NeighborVhFromEdge(vh, eh);
-		if (start == -1 || !mesh.isOnBoundary(MeshKernel::VertexHandle(start))) start = vh2;
+		if (start == -1 || mesh.isOnBoundary(eh)) start = vh2;
 		s.insert(vh2);
 		vtoe[vh2] = eh;
 	}
@@ -41,10 +104,12 @@ std::vector<MeshKernel::EdgeHandle> bff::AroundEdge(MeshKernel::VertexHandle vh)
 		s.erase(cur);
 		bool ok = 0;
 		for (auto& eh : mesh.NeighborEh(cur)) {
-			if (s.count(mesh.NeighborVhFromEdge(cur, eh))) {
-				nxt = mesh.NeighborVhFromEdge(cur, eh);
-				ok = 1;
-				break;
+			auto p = mesh.NeighborVhFromEdge(cur, eh);
+			if (s.count(p)) {
+				if (points_to_faces.count(std::make_tuple(int(vh), int(cur), int(p)))) {
+					nxt = p;
+					ok = 1;
+				}
 			}
 		}
 		if (!ok) break;
@@ -57,9 +122,8 @@ std::vector<MeshKernel::EdgeHandle> bff::AroundEdge(MeshKernel::VertexHandle vh)
 void bff::Parameterization() {
 	// 第一步 计算共形因子u
 	Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
-	Eigen::SparseMatrix<double> Aii_sparse = Aii.sparseView();
-	solver.compute(Aii_sparse);
-	//Eigen::MatrixXd ui = Aii.inverse() * -K;
+	solver.compute(Aii);
+	// Eigen::MatrixXd ui = Aii.inverse() * -K;
 	Eigen::MatrixXd ui = solver.solve(-K);
 	Eigen::MatrixXd ub = Eigen::MatrixXd::Zero(bn, 1);
 	Eigen::MatrixXd u(n, 1);
@@ -78,29 +142,28 @@ void bff::Parameterization() {
 		}
 	}
 	MeshKernel::VertexHandle s2 = s; // record
-	
 
 	// 微调长度使得边界闭合
-	Eigen::MatrixXd N = Eigen::MatrixXd::Zero(bn, bn);
-	Eigen::MatrixXd T = Eigen::MatrixXd::Zero(2, bn);
+	Eigen::SparseMatrix<double> N(bn, bn), N_inverse(bn, bn);
+	Eigen::SparseMatrix<double> T(2, bn);
 	Eigen::MatrixXd len = Eigen::MatrixXd::Zero(bn, 1), len_tilde = Eigen::MatrixXd::Zero(bn, 1);
 
-
-
 	double angle = 0;
+	vis.clear();
 	while (1) {
 		auto eh = NextEdge(s);
 		if ((int)eh > mesh.EdgeSize()) break;
 		t = mesh.NeighborVhFromEdge(s, eh);
 		vis[eh] = 1;
 		angle += k_tilde(to_new[s] - in, 0);
-		T(0, to_new[s] - in) = cos(angle), T(1, to_new[s] - in) = sin(angle);
+		T.coeffRef(0, to_new[s] - in) = cos(angle), T.coeffRef(1, to_new[s] - in) = sin(angle);
 		len(to_new[s] - in, 0) = exp(0.5 * (u(to_new[s], 0) + u(to_new[t], 0))) *
 			(mesh.vertices(mesh.edges(eh).vh1()) - mesh.vertices(mesh.edges(eh).vh2())).norm();
-		N(to_new[s] - in, to_new[s] - in) = 1 / len(to_new[s] - in, 0);
+		N.coeffRef(to_new[s] - in, to_new[s] - in) = 1 / len(to_new[s] - in, 0);
+		N_inverse.coeffRef(to_new[s] - in, to_new[s] - in) = len(to_new[s] - in, 0);
 		s = t;
 	}
-	len_tilde = len - (N.inverse() * T.transpose() * (T * N.inverse() * T.transpose()).inverse() * T) * len;
+	len_tilde = len - (N_inverse * T.transpose() * Eigen::MatrixXd(T * N_inverse * T.transpose()).inverse() * T) * len;
 	vis.clear();
 	angle = 0;
 	s = s2;
@@ -112,12 +175,12 @@ void bff::Parameterization() {
 		t = mesh.NeighborVhFromEdge(s, eh);
 		vis[eh] = 1;
 		angle += k_tilde(to_new[s] - in, 0);
-		gamma[t] = gamma[s] + MeshKernel::Vertex(T(0, to_new[s] - in), T(1, to_new[s] - in), 0) * len_tilde(to_new[s] - in, 0);
+		gamma[t] = gamma[s] + MeshKernel::Vertex(T.coeffRef(0, to_new[s] - in), T.coeffRef(1, to_new[s] - in), 0) * len_tilde(to_new[s] - in, 0);
 		s = t;
 	}
 
 	//std::cout << "bn:" << bn << " " << gamma.size() << std::endl;
-	//std::cout << " total angle:" << angle*180/PI << std::endl;
+	//std::cout << " total angle:" << angle * 180 / PI << std::endl;
 	Eigen::MatrixXd gamma_re = Eigen::MatrixXd::Zero(bn, 1);
 	Eigen::MatrixXd gamma_im = Eigen::MatrixXd::Zero(bn, 1);
 	for (auto x : gamma) {
@@ -125,8 +188,10 @@ void bff::Parameterization() {
 		gamma_im(to_new[x.first] - in, 0) = x.second.y();
 	}
 	/*
+	std::ofstream fout("data.txt");
+	fout << " total angle:" << angle * 180 / PI << std::endl;
 	for (auto x : gamma) {
-		std::cout << x.second.x() << " " << x.second.y() << " " << x.second.z() << std::endl;
+		fout << x.second.x() << " " << x.second.y() << " " << x.second.z() << std::endl;
 	}*/
 
 	// 第四步：延拓gamma为f
@@ -140,6 +205,7 @@ void bff::Parameterization() {
 	Eigen::MatrixXd b(n, 1);
 	b << bi,
 		gamma_im;
+	for (auto x : fake_points) mesh.DeleteVertex(x);
 	for (int i = 0; i < n; i++) {
 		auto vh = MeshKernel::VertexHandle(to_old[i]);
 		mesh.vertices(vh).setPosition(a(i, 0), b(i, 0), 0.0);
@@ -169,7 +235,6 @@ void bff::InitCurvature() {
 			defect += acos(cur * last / (cur.norm() * last.norm()));
 			defect = 2 * PI - defect;
 			K(to_new[vp.first], 0) = defect;
-
 		}
 		else {
 			for (auto& eh : AroundEdge(vp.first)) {
@@ -206,14 +271,19 @@ void bff::Init() {
 			to_old[points.size() - 1] = vp.first;
 		}
 	}
-}
-
-inline Eigen::MatrixXd submatrix(Eigen::MatrixXd const& A, int x, int y, int h, int w) {
-	Eigen::MatrixXd B(h, w);
-	for (int i = 0; i < h; i++) for (int j = 0; j < w; j++) {
-		B(i, j) = A(x + i, y + j);
+	for (auto& fp : mesh.allfaces()) {
+		auto &t = fp.second.getVertexHandle();
+		std::vector<int> tmp;
+		for (auto x : t) tmp.push_back(x);
+		assert((int)tmp.size() == 3);
+		for (int i = 0; i < 3; i++) {
+			for (int j = 0; j < 3; j++) if (i != j) {
+				for (int k = 0; k < 3; k++) if (k != i && k != j) {
+					points_to_faces[std::make_tuple(tmp[i], tmp[j], tmp[k])] = fp.first;
+				}
+			}
+		}
 	}
-	return B;
 }
 
 double bff::CotanAngles(MeshKernel::EdgeHandle eh) {
@@ -231,17 +301,21 @@ double bff::CotanAngles(MeshKernel::EdgeHandle eh) {
 }
 
 void bff::Laplace() {
-	A = Eigen::MatrixXd::Zero(n, n);
+	A.resize(n, n);
+	Aii.resize(in, in);
+	Aib.resize(in, bn);
+	Abi.resize(bn, in);
+	Abb.resize(bn, bn);
 	for (auto& ep : mesh.alledges()) {
 		auto& e = ep.second;
 		auto eh = ep.first;
 		auto vh1 = to_new[e.vh1()], vh2 = to_new[e.vh2()];
-		A(vh1, vh2) = A(vh2, vh1) = -0.5 * CotanAngles(eh);
-		A(vh1, vh1) += -A(vh1, vh2);
-		A(vh2, vh2) += -A(vh1, vh2);
+		A.coeffRef(vh1, vh2) = A.coeffRef(vh2, vh1) = -0.5 * CotanAngles(eh);
+		A.coeffRef(vh1, vh1) += -A.coeffRef(vh1, vh2);
+		A.coeffRef(vh2, vh2) += -A.coeffRef(vh1, vh2);
 	}
-	Aii = submatrix(A, 0, 0, in, in);
-	Aib = submatrix(A, 0, in, in, bn);
-	Abi = submatrix(A, in, 0, bn, in);
-	Abb = submatrix(A, in, in, bn, bn);
+	Aii = A.block(0, 0, in, in);
+	Aib = A.block(0, in, in, bn);
+	Abi = A.block(in, 0, bn, in);
+	Abb = A.block(in, in, bn, bn);
 }
